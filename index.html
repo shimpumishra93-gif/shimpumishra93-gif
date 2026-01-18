@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="hi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Shimpu Secure Vault</title>
+
+<style>
+:root{
+ --green:#22c55e;
+ --red:#ef4444;
+ --card:#111827;
+ --text:#f9fafb;
+ --muted:#9ca3af;
+}
+body{
+ margin:0;background:#020617;color:var(--text);
+ font-family:system-ui;padding:16px
+}
+.container{max-width:720px;margin:auto}
+.card{
+ background:var(--card);
+ padding:18px;border-radius:18px;
+ box-shadow:0 20px 40px rgba(0,0,0,.45)
+}
+h1{margin:0 0 14px;font-size:22px}
+label{display:block;margin-top:10px;font-size:13px;color:var(--muted)}
+input,button{
+ width:100%;margin-top:6px;
+ padding:12px;border-radius:14px;
+ border:none;font-size:15px
+}
+input{background:#020617;color:var(--text);border:1px solid #1f2937}
+button{background:var(--green);font-weight:700}
+button.red{background:var(--red);color:white}
+hr{border:none;border-top:1px solid #1f2937;margin:18px 0}
+
+#gallery{
+ display:grid;
+ grid-template-columns:repeat(auto-fill,minmax(100px,1fr));
+ gap:12px;margin-top:14px
+}
+.file-card{
+ background:#111827;border-radius:12px;
+ height:120px;display:flex;
+ flex-direction:column;justify-content:center;
+ align-items:center;cursor:pointer
+}
+.filename{
+ font-size:10px;color:var(--muted);
+ white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+ width:100%;text-align:center
+}
+
+#viewer{margin-top:16px;display:none}
+#viewer img{width:100%;max-height:92vh;border-radius:14px}
+#viewer video{width:100%;height:80vh;border-radius:14px}
+#viewer audio{width:100%;margin-top:20px}
+
+#pdfContainer{
+ width:100%;
+ max-height:92vh;
+ overflow:auto;
+ background:#000;
+ border-radius:14px;
+}
+canvas{width:100%!important;height:auto!important}
+
+.viewerButtons{display:flex;gap:10px;margin-top:16px}
+</style>
+</head>
+
+<body>
+<div class="container">
+<div class="card">
+
+<h1>🔐 Shimpu Secure Vault</h1>
+
+<label>Secret Files</label>
+<input type="file" id="dataFile" multiple>
+
+<label>Password</label>
+<input type="password" id="encKey">
+
+<label>Cover File</label>
+<input type="file" id="coverFile">
+
+<button id="encryptBtn">Encrypt</button>
+
+<hr>
+
+<label>Encrypted Cover</label>
+<input type="file" id="decFile">
+
+<label>Password</label>
+<input type="password" id="decKey">
+
+<button id="decryptBtn">Open Vault</button>
+
+<div id="gallery"></div>
+<div id="viewer"></div>
+
+<div class="viewerButtons">
+<button id="currentDownload">⬇ Current Download</button>
+<button id="allExport">⬇ Export All</button>
+</div>
+
+</div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+
+<script>
+const enc = new TextEncoder();
+const rand = n => crypto.getRandomValues(new Uint8Array(n));
+const CHUNK_SIZE = 8 * 1024 * 1024; // 8 MB
+
+let paused=false, encrypting=false, progress=0;
+let decryptedFiles=[], currentBlob=null, currentName="";
+let masterKey=null, masterSalt=null;
+
+function mime(n){
+ const e=n.split(".").pop().toLowerCase();
+ if(["png","jpg","jpeg","gif","webp"].includes(e))return"image/"+(e==="jpg"?"jpeg":e);
+ if(["mp4","webm"].includes(e))return"video/"+e;
+ if(["mp3","wav"].includes(e))return"audio/"+e;
+ if(e==="pdf")return"application/pdf";
+ return"application/octet-stream";
+}
+
+async function deriveMasterKey(password){
+ masterSalt = rand(16);
+ const base = await crypto.subtle.importKey(
+  "raw", enc.encode(password), "PBKDF2", false, ["deriveKey"]
+ );
+ masterKey = await crypto.subtle.deriveKey(
+  {name:"PBKDF2", salt:masterSalt, iterations:600000, hash:"SHA-256"},
+  base, {name:"AES-GCM", length:256}, false, ["encrypt","decrypt"]
+ );
+}
+
+/* ========= ENCRYPT ========= */
+encryptBtn.onclick = async () => {
+ if(encrypting){
+  paused=!paused;
+  encryptBtn.classList.toggle("red",paused);
+  encryptBtn.textContent = paused
+   ?`Encrypted ${progress}% | Resume Encryption`
+   :`Encrypting ${progress}% | Pause Encryption`;
+  return;
+ }
+
+ encrypting=true; paused=false; progress=0;
+ encryptBtn.textContent="Encrypting 0% | Pause Encryption";
+
+ const files=[...dataFile.files];
+ if(!files.length) return;
+
+ await deriveMasterKey(encKey.value);
+ const zip=new JSZip();
+ zip.file("__salt.bin", masterSalt);
+
+ let done=0;
+ for(const f of files){
+  while(paused) await new Promise(r=>setTimeout(r,200));
+
+  const folder = zip.folder(f.name);
+  const totalChunks = Math.ceil(f.size / CHUNK_SIZE);
+
+  for(let i=0;i<totalChunks;i++){
+   const start=i*CHUNK_SIZE;
+   const end=Math.min(start+CHUNK_SIZE,f.size);
+   const chunk=await f.slice(start,end).arrayBuffer();
+
+   const iv=rand(12);
+   const encd=await crypto.subtle.encrypt(
+    {name:"AES-GCM",iv}, masterKey, chunk
+   );
+
+   const idx=i.toString().padStart(4,"0");
+   folder.file(idx+".enc", new Uint8Array(encd));
+   folder.file(idx+".iv", iv);
+  }
+
+  folder.file("meta.json", JSON.stringify({
+   chunks: totalChunks,
+   size: f.size
+  }));
+
+  done++;
+  progress=Math.round(done/files.length*100);
+  encryptBtn.textContent=`Encrypting ${progress}% | Pause Encryption`;
+ }
+
+ const payload=await zip.generateAsync({type:"uint8array"});
+ const cover=coverFile.files[0];
+ const cbuf=new Uint8Array(await cover.arrayBuffer());
+
+ const out=new Uint8Array(cbuf.length+payload.length);
+ out.set(cbuf);
+ out.set(payload,cbuf.length);
+
+ encryptBtn.textContent="Encrypt Complete";
+ encrypting=false;
+
+ download(new Blob([out],{type:cover.type}),cover.name);
+};
+
+/* ========= DECRYPT ========= */
+decryptBtn.onclick = async () => {
+ const buf=new Uint8Array(await decFile.files[0].arrayBuffer());
+
+ let i=0;
+ for(;i<buf.length-3;i++)
+  if(buf[i]==80&&buf[i+1]==75&&buf[i+2]==3&&buf[i+3]==4) break;
+
+ const zip=await JSZip.loadAsync(buf.slice(i));
+ decryptedFiles=[]; gallery.innerHTML=""; viewer.style.display="none";
+
+ const salt=await zip.file("__salt.bin").async("uint8array");
+ const base=await crypto.subtle.importKey(
+  "raw", enc.encode(decKey.value), "PBKDF2", false, ["deriveKey"]
+ );
+ const key=await crypto.subtle.deriveKey(
+  {name:"PBKDF2", salt, iterations:600000, hash:"SHA-256"},
+  base,{name:"AES-GCM",length:256},false,["decrypt"]
+ );
+
+ for(const name in zip.files){
+  if(zip.files[name].dir && zip.file(name+"meta.json")){
+   const meta=JSON.parse(await zip.file(name+"meta.json").async("string"));
+   let parts=[];
+
+   for(let i=0;i<meta.chunks;i++){
+    const idx=i.toString().padStart(4,"0");
+    const encd=await zip.file(name+idx+".enc").async("uint8array");
+    const iv=await zip.file(name+idx+".iv").async("uint8array");
+    const dec=await crypto.subtle.decrypt({name:"AES-GCM",iv},key,encd);
+    parts.push(new Uint8Array(dec));
+   }
+
+   let size=parts.reduce((s,p)=>s+p.length,0);
+   let merged=new Uint8Array(size),off=0;
+   for(const p of parts){merged.set(p,off);off+=p.length;}
+
+   decryptedFiles.push({name:name.replace(/\/$/,""),data:merged});
+  }
+ }
+
+ decryptedFiles.forEach(f=>{
+  const c=document.createElement("div");
+  c.className="file-card";
+  c.onclick=()=>openFile(f);
+  c.innerHTML=`<div>${f.name.split('.').pop()}</div><div class="filename">${f.name}</div>`;
+  gallery.appendChild(c);
+ });
+};
+
+/* ========= VIEW ========= */
+async function openFile(f){
+ viewer.innerHTML=""; viewer.style.display="block";
+ currentBlob=new Blob([f.data],{type:mime(f.name)});
+ currentName=f.name;
+
+ if(currentBlob.type==="application/pdf"){
+  const container=document.createElement("div");
+  container.id="pdfContainer";
+  viewer.appendChild(container);
+
+  const pdf=await pdfjsLib.getDocument({data:f.data}).promise;
+  for(let p=1;p<=pdf.numPages;p++){
+   const page=await pdf.getPage(p);
+   const vp=page.getViewport({scale:1.5});
+   const canvas=document.createElement("canvas");
+   canvas.width=vp.width; canvas.height=vp.height;
+   await page.render({canvasContext:canvas.getContext("2d"),viewport:vp}).promise;
+   container.appendChild(canvas);
+  }
+  return;
+ }
+
+ const url=URL.createObjectURL(currentBlob);
+ let el;
+ if(currentBlob.type.startsWith("image")) el=document.createElement("img");
+ else if(currentBlob.type.startsWith("video")){el=document.createElement("video");el.controls=true}
+ else if(currentBlob.type.startsWith("audio")){el=document.createElement("audio");el.controls=true}
+ el.src=url; viewer.appendChild(el);
+}
+
+currentDownload.onclick=()=>currentBlob&&download(currentBlob,currentName);
+allExport.onclick=()=>{
+ const z=new JSZip();
+ decryptedFiles.forEach(f=>z.file(f.name,f.data));
+ z.generateAsync({type:"blob"}).then(b=>download(b,"All_Files.zip"));
+};
+
+function download(blob,name){
+ const a=document.createElement("a");
+ a.href=URL.createObjectURL(blob);
+ a.download=name;
+ a.click();
+}
+</script>
+</body>
+</html>
